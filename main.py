@@ -1,9 +1,10 @@
-"""Telegram bot that transcribes voice and audio messages using Groq Whisper."""
+"""Telegram bot that transcribes voice and audio messages with Groq Whisper and polishes the text."""
 
 import asyncio
 import io
 import logging
 import os
+from typing import Awaitable, Callable
 
 from dotenv import load_dotenv
 from groq import AsyncGroq, BadRequestError, RateLimitError
@@ -11,9 +12,20 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 MODEL = "whisper-large-v3"
+POLISH_MODEL = "openai/gpt-oss-120b"
 MAX_FILE_SIZE = 20 * 1024 * 1024  # Telegram Bot API download limit for bots
 TELEGRAM_MESSAGE_LIMIT = 4096
 MAX_RETRY_AFTER = 30  # seconds; longer waits are reported to the user instead
+
+POLISH_SYSTEM_PROMPT = """You are an expert editor specializing in cleaning and correcting speech-to-text (ASR/STT) transcriptions. Your task is to fix technical voice recognition errors and structure the text for readability while keeping the speaker's original style, slang, language, and voice completely intact.
+
+Editing rules:
+1. Spelling and reconstruction: Fix transcription errors, cut-off words, or phonetically misinterpreted words based on sentence context (e.g., reconstructing clipped characters or missing accents/diacritics). Keep the output in the exact same language as the input transcription.
+2. Punctuation and formatting: Add punctuation marks (commas, periods, question/exclamation marks, ellipses, and em-dashes) that reflect the natural pauses, interruptions, and rhythm of speech. Break the text into paragraphs whenever there is a clear shift in topic or idea.
+3. Strict fidelity: DO NOT summarize, DO NOT paraphrase, DO NOT replace colloquial vocabulary with formal language, and DO NOT remove characteristic filler words (e.g., "like", "you know", "o sea", "pues"), unless they are accidental syllable stutters caused by an audio glitch.
+
+Output constraint:
+Return ONLY the corrected text. Do not include greetings, introductions, wrapping quotation marks, footnotes, or explanations of the changes made."""
 
 logging.basicConfig(
     level=logging.INFO,
@@ -86,16 +98,11 @@ def retry_after_seconds(error: RateLimitError) -> int:
         return 60
 
 
-async def transcribe_audio(groq: AsyncGroq, filename: str, data: bytes) -> str:
-    """Transcribe audio with Groq, retrying once when rate limited."""
+async def retry_rate_limit(call: Callable[[], Awaitable[str]]) -> str:
+    """Run an async Groq call, retrying once when rate limited."""
     for attempt in range(2):
         try:
-            result = await groq.audio.transcriptions.create(
-                file=(filename, data),
-                model=MODEL,
-                response_format="json",
-            )
-            return result.text
+            return await call()
         except RateLimitError as error:
             wait = retry_after_seconds(error)
             if attempt == 1 or wait > MAX_RETRY_AFTER:
@@ -105,13 +112,53 @@ async def transcribe_audio(groq: AsyncGroq, filename: str, data: bytes) -> str:
     raise RuntimeError("unreachable")  # the loop always returns or raises
 
 
+async def transcribe_audio(groq: AsyncGroq, filename: str, data: bytes) -> str:
+    """Transcribe audio with Groq, retrying once when rate limited."""
+
+    async def call() -> str:
+        result = await groq.audio.transcriptions.create(
+            file=(filename, data),
+            model=MODEL,
+            response_format="json",
+        )
+        return result.text
+
+    return await retry_rate_limit(call)
+
+
+def polish_user_prompt(text: str) -> str:
+    """Build the user message that asks for a cleaned-up transcription."""
+    return (
+        "Clean and format the following transcription:\n\n"
+        f"<transcription>\n{text}\n</transcription>"
+    )
+
+
+async def polish_transcription(groq: AsyncGroq, text: str) -> str:
+    """Polish a raw transcription with Groq chat completions, retrying once when rate limited."""
+
+    async def call() -> str:
+        completion = await groq.chat.completions.create(
+            model=POLISH_MODEL,
+            messages=[
+                {"role": "system", "content": POLISH_SYSTEM_PROMPT},
+                {"role": "user", "content": polish_user_prompt(text)},
+            ],
+            max_completion_tokens=65536,  # model maximum; the API default could truncate long texts
+            temperature=0,  # deterministic: keep edits conservative and close to the original wording
+        )
+        return (completion.choices[0].message.content or "").strip()
+
+    return await retry_rate_limit(call)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     if user is None or not is_allowed(user.id):
         await deny_access(update)
         return
     await update.message.reply_text(
-        "Send me a voice message or an audio file and I'll transcribe it.\n"
+        "Send me a voice message or an audio file and I'll transcribe and polish it.\n"
         f"Your user ID: {user.id}"
     )
 
@@ -143,13 +190,20 @@ async def transcribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             filename = media.file_name or f"audio.{subtype}"
 
         groq: AsyncGroq = context.application.bot_data["groq"]
-        text = (await transcribe_audio(groq, filename, data)).strip()
+        raw = (await transcribe_audio(groq, filename, data)).strip()
 
-        if not text:
+        if not raw:
             await status.edit_text("No speech detected.")
             return
 
-        chunks = split_message(text)
+        await status.edit_text("Polishing...")
+        try:
+            polished = await polish_transcription(groq, raw)
+        except Exception:
+            logger.exception("Polishing failed, sending the raw transcription")
+            polished = ""
+
+        chunks = split_message(polished or raw)
         await status.edit_text(chunks[0])
         for chunk in chunks[1:]:
             await message.reply_text(chunk)

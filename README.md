@@ -1,7 +1,8 @@
 # Telegram Transcriber Bot
 
 A Telegram bot that receives voice messages and audio files, transcribes them with
-[Groq](https://console.groq.com/docs/speech-to-text) (`whisper-large-v3`), and replies with the text.
+[Groq](https://console.groq.com/docs/speech-to-text) (`whisper-large-v3`), polishes the result with
+`openai/gpt-oss-120b`, and replies with the cleaned-up text.
 
 ## Setup
 
@@ -53,17 +54,24 @@ uv run main.py
 ```
 
 The program starts and keeps running, polling Telegram for updates. Open your bot in Telegram and
-send it a voice message or an audio file — it replies with the transcription.
+send it a voice message or an audio file — it replies with the polished transcription.
 
 ## Usage
 
 - Accepts **voice messages** and **audio files** (ogg, mp3, m4a, wav, ...) up to **20 MB**.
 - The transcription language is detected automatically.
+- The text is polished automatically: recognition errors are fixed and punctuation/paragraphs are
+  added, while keeping the speaker's wording, slang, and style.
 - Long transcriptions are split into multiple messages.
 - `/start` shows a short usage hint.
 
 ## Notes
 
 - Transcription runs on `whisper-large-v3` via the Groq API.
-- Groq rate limits (developer tier): about **20 requests/min** and **2,000 requests/day**. When the
-  limit is hit, the bot tells you how long to wait before retrying.
+- Polishing runs on `openai/gpt-oss-120b` via the Groq chat API with a fixed editor prompt. If the
+  polish step fails, the raw transcription is sent instead.
+- Groq rate limits (developer tier): about **20 requests/min** and **2,000 requests/day** — each
+  message consumes two requests (transcribe + polish). When the limit is hit, the bot tells you how
+  long to wait before retrying.
+- `test_pipeline.py` runs the transcribe + polish pipeline on `audio.ogg` without Telegram:
+  `.venv/Scripts/python.exe test_pipeline.py`.
